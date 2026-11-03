@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Gridlock Authority: Director's Cut</title>
+    <style>
+        body { margin: 0; background: #121212; color: white; font-family: 'Segoe UI', sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+        #game-wrapper { display: flex; gap: 20px; background: #1e1e1e; padding: 20px; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,0.8); border: 1px solid #333; }
+        canvas { background: #2a2a2a; border-radius: 8px; border: 2px solid #444; box-shadow: inset 0 0 50px rgba(0,0,0,0.5); }
+        #ui { width: 280px; display: flex; flex-direction: column; gap: 10px; }
+        h1 { color: #f9a825; margin: 0 0 10px 0; font-size: 22px; text-transform: uppercase; letter-spacing: 1px; text-shadow: 0 2px 4px rgba(0,0,0,0.5); }
+        .stat-box { background: #111; padding: 15px; border-radius: 8px; border: 1px solid #333; display: flex; justify-content: space-between; font-weight: bold; font-size: 18px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        .cash { color: #4caf50; text-shadow: 0 0 10px rgba(76, 175, 80, 0.4); }
+        button { padding: 12px; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 6px; cursor: pointer; font-weight: bold; text-align: left; display: flex; justify-content: space-between; transition: 0.2s; font-size: 13px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+        button:hover:not(:disabled) { background: #333; border-color: #f9a825; transform: translateY(-1px); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        button span { color: #f9a825; }
+        .law-btn { border-color: #00a2ff; color: #00a2ff; }
+        .law-btn.active { background: #00a2ff; color: #000; box-shadow: 0 0 15px rgba(0, 162, 255, 0.4); }
+        .law-btn.active span { color: #000; }
+        hr { border: 0; height: 1px; background: #333; margin: 10px 0; width: 100%; }
+    </style>
+</head>
+<body>
+
+<div id="game-wrapper">
+    <canvas id="game" width="900" height="900"></canvas>
+    
+    <div id="ui">
+        <h1>Gridlock Authority</h1>
+        <div class="stat-box">
+            <span>Cash:</span>
+            <span class="cash" id="ui-cash">$0</span>
+        </div>
+        <div class="stat-box">
+            <span>Gridlock Risk:</span>
+            <span id="ui-risk" style="color:#4caf50;">0%</span>
+        </div>
+
+        <hr>
+        <h3 style="margin:0; font-size:14px; color:#aaa;">Upgrades</h3>
+        <button id="btn-spawn">Traffic Flow <span>Cost: $100</span></button>
+        <button id="btn-speed">Speed Limit <span>Cost: $250</span></button>
+
+        <hr>
+        <h3 style="margin:0; font-size:14px; color:#aaa;">City Laws</h3>
+        <button id="law-red" class="law-btn">Right Turn on Red <span>OFF</span></button>
+        
+        <hr>
+        <h3 style="margin:0; font-size:14px; color:#aaa;">Infrastructure</h3>
+        <button id="btn-roundabout">Convert Center to Roundabout <span>Cost: $5000</span></button>
+    </div>
+</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const CONFIG = {
+    roadWidth: 100,
+    carW: 18, carH: 36,
+    truckW: 24, truckH: 60,
+    spawnRate: 2000,
+    baseSpeed: 1.5,
+};
+
+let cash = 0;
+let risk = 0;
+let cars = [];
+let particles = [];
+let lastSpawn = 0;
+let currentSpawnRate = CONFIG.spawnRate;
+let currentSpeed = CONFIG.baseSpeed;
+let rightTurnOnRed = false;
+let roundaboutActive = false;
+
+const upgrades = { spawn: 100, speed: 250, roundabout: 5000 };
+
+const intersections = [
+    { id: 'TL', x: 250, y: 250, light: 'NS', timer: 0 },
+    { id: 'TR', x: 650, y: 250, light: 'NS', timer: 0 },
+    { id: 'BL', x: 250, y: 650, light: 'NS', timer: 0 },
+    { id: 'BR', x: 650, y: 650, light: 'NS', timer: 0 }
+];
+
+class Vehicle {
+    constructor(type, path) {
+        this.type = type;
+        this.path = path;
+        this.currentNode = 0;
+        
+        // Dimensions and Stats
+        if (type === 'car') {
+            this.w = CONFIG.carW; this.h = CONFIG.carH;
+            this.speed = currentSpeed; this.payout = 10;
+            this.color = '#3498db';
+        } else if (type === 'truck') {
+            this.w = CONFIG.truckW; this.h = CONFIG.truckH;
+            this.speed = currentSpeed * 0.6; this.payout = 30;
+            this.color = '#e67e22';
+        } else if (type === 'ambulance') {
+            this.w = CONFIG.carW; this.h = CONFIG.carH;
+            this.speed = currentSpeed * 1.8; this.payout = 100;
+            this.color = '#ecf0f1';
+            this.flash = 0;
+        }
+
+        this.x = path[0].x;
+        this.y = path[0].y;
+        this.angle = 0; // Rotation
+        this.dead = false;
+        this.passedIntersection = false;
+        this.waiting = false;
+    }
+
+    update(dt) {
+        if (this.dead) return;
+
+        let target = this.path[this.currentNode];
+        let dx = target.x - this.x;
+        let dy = target.y - this.y;
+        let dist = Math.hypot(dx, dy);
+
+        // Calculate angle for drawing
+        if (Math.abs(dx) > Math.abs(dy)) {
+            this.angle = dx > 0 ? Math.PI/2 : -Math.PI/2;
+        } else {
+            this.angle = dy > 0 ? Math.PI : 0;
+        }
+
+        // Intersection logic
+        if (target.intersectionId && dist < 80 && !this.passedIntersection) {
+            let inter = intersections.find(i => i.id === target.intersectionId);
+            let allowGo = true;
+
+            if (!roundaboutActive) {
+                let isNS = (Math.abs(dy) > Math.abs(dx));
+                if (inter.light === 'EW' && isNS) allowGo = false;
+                if (inter.light === 'NS' && !isNS) allowGo = false;
+                if (inter.light === 'YELLOW' && dist > 40) allowGo = false;
+
+                if (!allowGo && rightTurnOnRed) {
+                    let nextNode = this.path[this.currentNode + 1];
+                    if (nextNode) {
+                        let isTurningRight = (isNS && nextNode.x > target.x) || 
+                                             (!isNS && nextNode.y < target.y);
+                        if (isTurningRight && dist < 50) allowGo = true;
+                    }
+                }
+            } else {
+                let inRoundabout = cars.some(c => c !== this && Math.hypot(c.x - target.x, c.y - target.y) < 70);
+                if (inRoundabout && dist > 40 && dist < 80) allowGo = false;
+            }
+
+            if (!allowGo) {
+                this.waiting = true;
+                return;
+            } else {
+                this.waiting = false;
+                if (dist < 30) this.passedIntersection = true;
+            }
+        }
+
+        // Movement
+        if (dist > 0) {
+            this.x += (dx / dist) * this.speed;
+            this.y += (dy / dist) * this.speed;
+        }
+
+        // Collision check
+        for (let other of cars) {
+            if (other === this || other.dead) continue;
+            let d = Math.hypot(this.x - other.x, this.y - other.y);
+            if (d < (this.h / 2 + other.h / 2) - 5) {
+                if (Math.sign(dx) === Math.sign(other.x - this.x) || Math.sign(dy) === Math.sign(other.y - this.y)) {
+                    this.speed = 0;
+                }
+            }
+        }
+        if (this.speed === 0) this.speed = (this.type === 'truck' ? currentSpeed * 0.6 : currentSpeed);
+
+        // Exit logic
+        if (dist < this.speed) {
+            this.x = target.x;
+            this.y = target.y;
+            this.currentNode++;
+            this.passedIntersection = false;
+            if (this.currentNode >= this.path.length) {
+                this.dead = true;
+                cash += this.payout;
+                spawnParticle(this.x, this.y, `+$${this.payout}`, '#4caf50');
+                updateUI();
+            }
+        }
+        if (this.type === 'ambulance') this.flash += 0.2;
+    }
+
+    draw() {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.angle);
+
+        // Drop Shadow
+        ctx.fillStyle = 'rgba(0,0,0,0.4)';
+        ctx.beginPath();
+        ctx.roundRect(-this.w/2 + 3, -this.h/2 + 3, this.w, this.h, 4);
+        ctx.fill();
+
+        // Chassis
+        let bodyColor = this.waiting ? '#e74c3c' : this.color;
+        if (this.type === 'ambulance') {
+            bodyColor = (Math.floor(this.flash) % 2 === 0) ? '#e74c3c' : '#ffffff';
+        }
+        
+        ctx.fillStyle = bodyColor;
+        ctx.beginPath();
+        ctx.roundRect(-this.w/2, -this.h/2, this.w, this.h, 4);
+        ctx.fill();
+
+        // Details (Windshields, lights)
+        if (this.type === 'car' || this.type === 'ambulance') {
+            // Windshield
+            ctx.fillStyle = '#2c3e50';
+            ctx.fillRect(-this.w/2 + 3, -this.h/2 + 8, this.w - 6, 8);
+            // Headlights
+            ctx.fillStyle = '#f1c40f';
+            ctx.fillRect(-this.w/2 + 2, -this.h/2 + 1, 4, 2);
+            ctx.fillRect(this.w/2 - 6, -this.h/2 + 1, 4, 2);
+            // Ambulance Cross
+            if (this.type === 'ambulance') {
+                ctx.fillStyle = '#e74c3c';
+                ctx.fillRect(-4, -this.h/2 + 22, 8, 16);
+                ctx.fillRect(-8, -this.h/2 + 26, 16, 8);
+            }
+        } else if (this.type === 'truck') {
+            // Cab
+            ctx.fillStyle = '#d35400';
+            ctx.fillRect(-this.w/2, -this.h/2, this.w, 15);
+            // Windshield
+            ctx.fillStyle = '#2c3e50';
+            ctx.fillRect(-this.w/2 + 2, -this.h/2 + 4, this.w - 4, 6);
+            // Cargo Box
+            ctx.fillStyle = '#bdc3c7';
+            ctx.fillRect(-this.w/2 + 2, -this.h/2 + 18, this.w - 4, this.h - 22);
+        }
+
+        ctx.restore();
+    }
+}
+
+// Particle System for Cash
+function spawnParticle(x, y, text, color) {
+    particles.push({ x, y, text, color, alpha: 1, life: 1 });
+}
+
+// Generate a random path
+function generatePath() {
+    const edges = ['Top', 'Bottom', 'Left', 'Right'];
+    const startEdge = edges[Math.floor(Math.random() * edges.length)];
+    let path = [];
+
+    if (startEdge === 'Top') path = [{x: 250, y: -50}, {x: 250, y: 250, intersectionId: 'TL'}, {x: 250, y: 650, intersectionId: 'BL'}, {x: 250, y: 950}];
+    else if (startEdge === 'Bottom') path = [{x: 650, y: 950}, {x: 650, y: 650, intersectionId: 'BR'}, {x: 650, y: 250, intersectionId: 'TR'}, {x: 650, y: -50}];
+    else if (startEdge === 'Left') path = [{x: -50, y: 250}, {x: 250, y: 250, intersectionId: 'TL'}, {x: 650, y: 250, intersectionId: 'TR'}, {x: 950, y: 250}];
+    else if (startEdge === 'Right') path = [{x: 950, y: 650}, {x: 650, y: 650, intersectionId: 'BR'}, {x: 250, y: 650, intersectionId: 'BL'}, {x: -50, y: 650}];
+
+    let r = Math.random();
+    let type = 'car';
+    if (r > 0.8) type = 'truck';
+    if (r > 0.95) type = 'ambulance';
+
+    return new Vehicle(type, path);
+}
+
+// Draw Roads and Environment
+function drawEnvironment() {
+    // Grass
+    ctx.fillStyle = '#2c3e50';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Road Base
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(250 - CONFIG.roadWidth/2, 0, CONFIG.roadWidth, canvas.height);
+    ctx.fillRect(650 - CONFIG.roadWidth/2, 0, CONFIG.roadWidth, canvas.height);
+    ctx.fillRect(0, 250 - CONFIG.roadWidth/2, canvas.width, CONFIG.roadWidth);
+    ctx.fillRect(0, 650 - CONFIG.roadWidth/2, canvas.width, CONFIG.roadWidth);
+
+    // Road details (crosswalks & stop lines)
+    intersections.forEach(inter => {
+        if (inter.id === 'TL' && roundaboutActive) {
+            ctx.fillStyle = '#333';
+            ctx.beginPath(); ctx.arc(inter.x, inter.y, 60, 0, Math.PI*2); ctx.fill();
+            ctx.fillStyle = '#2c3e50';
+            ctx.beginPath(); ctx.arc(inter.x, inter.y, 30, 0, Math.PI*2); ctx.fill();
+            return;
+        }
+
+        // Crosswalks
+        ctx.fillStyle = 'rgba(255,255,255,0.2)';
+        for(let i=-40; i<=40; i+=15) {
+            ctx.fillRect(inter.x + i, inter.y - 60, 8, 15);
+            ctx.fillRect(inter.x + i, inter.y + 45, 8, 15);
+            ctx.fillRect(inter.x - 60, inter.y + i, 15, 8);
+            ctx.fillRect(inter.x + 45, inter.y + i, 15, 8);
+        }
+
+        // Traffic Lights Base
+        ctx.fillStyle = '#000';
+        ctx.fillRect(inter.x - 70, inter.y - 70, 20, 30);
+        ctx.fillRect(inter.x + 50, inter.y + 40, 20, 30);
+
+        // NS Light
+        ctx.fillStyle = (inter.light === 'NS') ? '#4caf50' : '#d32f2f';
+        ctx.beginPath(); ctx.arc(inter.x - 60, inter.y - 60, 8, 0, Math.PI*2); ctx.fill();
+        
+        // EW Light
+        ctx.fillStyle = (inter.light === 'EW') ? '#4caf50' : '#d32f2f';
+        ctx.beginPath(); ctx.arc(inter.x + 60, inter.y + 60, 8, 0, Math.PI*2); ctx.fill();
+    });
+
+    // Dashed Lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([15, 15]);
+    ctx.beginPath();
+    ctx.moveTo(250, 0); ctx.lineTo(250, 250); ctx.moveTo(250, 350); ctx.lineTo(250, 550); ctx.moveTo(250, 750); ctx.lineTo(250, 900);
+    ctx.moveTo(650, 0); ctx.lineTo(650, 250); ctx.moveTo(650, 350); ctx.lineTo(650, 550); ctx.moveTo(650, 750); ctx.lineTo(650, 900);
+    ctx.moveTo(0, 250); ctx.lineTo(250, 250); ctx.moveTo(350, 250); ctx.lineTo(550, 250); ctx.moveTo(750, 250); ctx.lineTo(900, 250);
+    ctx.moveTo(0, 650); ctx.lineTo(250, 650); ctx.moveTo(350, 650); ctx.lineTo(550, 650); ctx.moveTo(750, 650); ctx.lineTo(900, 650);
+    ctx.stroke();
+    ctx.setLineDash([]);
+}
+
+let lastTime = 0;
+function gameLoop(time) {
+    const dt = time - lastTime;
+    lastTime = time;
+
+    // Lights
+    intersections.forEach(inter => {
+        if (!roundaboutActive && inter.id !== 'TL') { // Skip TL if it's a roundabout
+            inter.timer += dt;
+            if (inter.timer > 4000) {
+                inter.light = (inter.light === 'NS') ? 'EW' : 'NS';
+                inter.timer = 0;
+            }
+        }
+    });
+
+    // Spawning
+    if (time - lastSpawn > currentSpawnRate) {
+        cars.push(generatePath());
+        lastSpawn = time;
+    }
+
+    // Updates
+    cars.forEach(c => c.update(dt));
+    
+    // Particles
+    particles.forEach(p => {
+        p.y -= 1; // Float up
+        p.alpha -= 0.02; // Fade out
+    });
+    particles = particles.filter(p => p.alpha > 0);
+
+    // Risk calculation
+    let waitingCars = cars.filter(c => c.waiting).length;
+    risk = Math.min(100, Math.floor((waitingCars / 10) * 100));
+    document.getElementById('ui-risk').style.color = risk >= 100 ? '#d32f2f' : '#f9a825';
+
+    cars = cars.filter(c => !c.dead);
+
+    // Draw
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    drawEnvironment();
+    cars.forEach(c => c.draw());
+    
+    // Draw Particles
+    particles.forEach(p => {
+        ctx.fillStyle = `rgba(76, 175, 80, ${p.alpha})`;
+        ctx.font = 'bold 18px Arial';
+        ctx.fillText(p.text, p.x, p.y);
+    });
+
+    requestAnimationFrame(gameLoop);
+}
+
+// Click to switch lights
+canvas.addEventListener('click', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const clickY = e.clientY - rect.top;
+
+    intersections.forEach(inter => {
+        if (!roundaboutActive || inter.id !== 'TL') {
+            if (Math.hypot(clickX - inter.x, clickY - inter.y) < 60) {
+                if (inter.light === 'NS') inter.light = 'YELLOW';
+                else if (inter.light === 'YELLOW') inter.light = 'EW';
+                else inter.light = 'NS';
+                inter.timer = 0;
+            }
+        }
+    });
+});
+
+// UI & Upgrades
+function updateUI() {
+    document.getElementById('ui-cash').innerText = '$' + cash.toLocaleString();
+    document.getElementById('btn-spawn').disabled = cash < upgrades.spawn;
+    document.getElementById('btn-speed').disabled = cash < upgrades.speed;
+    document.getElementById('btn-roundabout').disabled = cash < upgrades.roundabout || roundaboutActive;
+    document.getElementById('ui-risk').innerText = risk + '%';
+}
+
+document.getElementById('btn-spawn').addEventListener('click', () => {
+    if (cash >= upgrades.spawn) {
+        cash -= upgrades.spawn;
+        currentSpawnRate = Math.max(400, currentSpawnRate - 200);
+        upgrades.spawn *= 2;
+        document.querySelector('#btn-spawn span').innerText = `Cost: $${upgrades.spawn}`;
+        updateUI();
+    }
+});
+
+document.getElementById('btn-speed').addEventListener('click', () => {
+    if (cash >= upgrades.speed) {
+        cash -= upgrades.speed;
+        currentSpeed += 0.3;
+        upgrades.speed *= 2;
+        document.querySelector('#btn-speed span').innerText = `Cost: $${upgrades.speed}`;
+        updateUI();
+    }
+});
+
+document.getElementById('law-red').addEventListener('click', (e) => {
+    rightTurnOnRed = !rightTurnOnRed;
+    e.target.classList.toggle('active');
+    e.target.querySelector('span').innerText = rightTurnOnRed ? 'ON' : 'OFF';
+});
+
+document.getElementById('btn-roundabout').addEventListener('click', () => {
+    if (cash >= upgrades.roundabout) {
+        cash -= upgrades.roundabout;
+        roundaboutActive = true;
+        document.querySelector('#btn-roundabout span').innerText = 'ACTIVE';
+        updateUI();
+    }
+});
+
+updateUI();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
